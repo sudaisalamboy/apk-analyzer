@@ -4,7 +4,7 @@ APK Analyzer — Standalone script for analyzing Android APK packages.
 Performs static analysis: manifest inspection, secret scanning, security checks.
 
 Usage:
-    python3 analyze.py <apk-path> [--full-report] [--manifest-only]
+    python3 analyze.py <apk-path> [--full-report] [--manifest-only] [--help]
 """
 
 import sys
@@ -12,6 +12,8 @@ import os
 import subprocess
 import re
 import json
+import shutil
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -25,32 +27,47 @@ DANGEROUS_PERMISSIONS = {
     "SYSTEM_ALERT_WINDOW", "REQUEST_INSTALL_PACKAGES",
 }
 
+# Fix #8: Added missing secret patterns (Slack, Twitter, generic password)
 SECRET_PATTERNS = [
     ("Google API Key", r"AIza[0-9A-Za-z_\-]{35}"),
     ("Stripe Secret", r"sk_live_[0-9a-zA-Z]{24,}"),
+    ("Stripe Publishable", r"pk_live_[0-9a-zA-Z]{24,}"),
     ("GitHub Token", r"gh[pousr]_[A-Za-z0-9]{36}"),
     ("AWS Access Key", r"AKIA[0-9A-Z]{16}"),
     ("Firebase Key", r"AAAA[A-Za-z0-9_\-]{35}"),
     ("JWT Token", r"eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),
+    ("Slack Token", r"xox[baprs]-[A-Za-z0-9-]+"),
+    ("Twitter Bearer", r"AAAAAAAAAAAAAAAA[A-Za-z0-9%]{40,}"),
+    ("Generic Password", r'(?:password|passwd|pwd|secret)["\']?\s*[:=]\s*["\']([^"\'\s]{4,})'),
 ]
 
-URL_PATTERN = re.compile(r"https?://[a-zA-Z0-9.\-/]+")
+# Fix #1: Updated URL regex to capture query params, ports, fragments
+URL_PATTERN = re.compile(r"https?://[a-zA-Z0-9._~:/?#@!$&'()*+,;=%\-]+")
 
 
 def log(msg):
     print(f"[apk-analyzer] {msg}")
 
 
+# Fix #3: Handle missing apktool gracefully
 def decode_apk(apk_path, output_dir):
     log(f"Decoding {apk_path}...")
-    result = subprocess.run(
-        ["apktool", "d", "-f", "-o", output_dir, apk_path],
-        capture_output=True, text=True, timeout=120
-    )
-    if result.returncode != 0:
-        log(f"apktool failed: {result.stderr[:200]}")
+    try:
+        result = subprocess.run(
+            ["apktool", "d", "-f", "-o", output_dir, apk_path],
+            capture_output=True, text=True, timeout=120
+        )
+        if result.returncode != 0:
+            log(f"apktool failed: {result.stderr[:200]}")
+            return False
+        return True
+    except FileNotFoundError:
+        log("ERROR: apktool is not installed.")
+        log("Install it: apt install apktool  OR  download from https://ibotpeaches.github.io/Apktool/")
         return False
-    return True
+    except subprocess.TimeoutExpired:
+        log("ERROR: apktool timed out (120s). The APK might be too large.")
+        return False
 
 
 def analyze_manifest(decoded_dir):
@@ -95,26 +112,46 @@ def analyze_manifest(decoded_dir):
     }
 
 
+# Fix #2: Track line numbers using enumerate
 def scan_secrets(decoded_dir):
     findings = []
     smali_dirs = [d for d in Path(decoded_dir).iterdir() if d.is_dir() and d.name.startswith("smali")]
     for smali_dir in smali_dirs:
         for smali_file in smali_dir.rglob("*.smali"):
             try:
-                content = smali_file.read_text(errors="ignore")
+                lines = smali_file.read_text(errors="ignore").split("\n")
             except:
                 continue
             rel_path = str(smali_file.relative_to(decoded_dir))
             for name, pattern in SECRET_PATTERNS:
-                matches = re.findall(pattern, content)
-                for match in matches:
-                    findings.append({
-                        "type": name, "value": match[:40] + "..." if len(match) > 40 else match,
-                        "file": rel_path, "severity": "CRITICAL" if "Key" in name or "Token" in name else "HIGH",
-                    })
+                regex = re.compile(pattern)
+                for line_num, line in enumerate(lines, 1):
+                    matches = regex.findall(line)
+                    for match in matches:
+                        value = match if isinstance(match, str) else match[0]
+                        findings.append({
+                            "type": name,
+                            "value": value[:50] + "..." if len(value) > 50 else value,
+                            "file": rel_path,
+                            "line": line_num,
+                            "severity": "CRITICAL" if "Key" in name or "Token" in name else "HIGH",
+                        })
+            # Scan URLs
+            for line_num, line in enumerate(lines, 1):
+                urls = URL_PATTERN.findall(line)
+                for url in set(urls):
+                    if any(domain in url for domain in ["api.", "firebaseio", "googleapis", ".com/api", ".io/api"]):
+                        findings.append({
+                            "type": "API Endpoint",
+                            "value": url[:60],
+                            "file": rel_path,
+                            "line": line_num,
+                            "severity": "MEDIUM",
+                        })
     return findings
 
 
+# Fix #4: Handle missing keytool specifically
 def check_signing(apk_path):
     try:
         result = subprocess.run(["keytool", "-printcert", "-jarfile", apk_path],
@@ -122,9 +159,11 @@ def check_signing(apk_path):
         if result.returncode == 0:
             owner = re.search(r"Owner:\s*(.+)", result.stdout)
             return {"signed": True, "certificate_owner": owner.group(1).strip() if owner else "unknown"}
-    except:
-        pass
-    return {"signed": False, "certificate_owner": "unknown"}
+        return {"signed": False, "certificate_owner": "not signed or keytool error"}
+    except FileNotFoundError:
+        return {"signed": False, "certificate_owner": "keytool not installed"}
+    except Exception:
+        return {"signed": False, "certificate_owner": "unknown error"}
 
 
 def generate_report(manifest_data, secrets, signing, apk_name):
@@ -180,19 +219,21 @@ def generate_report(manifest_data, secrets, signing, apk_name):
     if secrets:
         for s in secrets:
             report += f"\n### [{s['severity']}] {s['type']}\n"
-            report += f"- **File:** {s['file']}\n"
+            report += f"- **File:** {s['file']}:{s.get('line', '?')}\n"
             report += f"- **Evidence:** `{s['value']}`\n"
     else:
         report += "\n✅ No secrets found.\n"
 
     critical = len([s for s in secrets if s["severity"] == "CRITICAL"])
     high = len([s for s in secrets if s["severity"] == "HIGH"])
-    risk = "Critical" if critical else "High" if high else "Low"
+    medium = len([s for s in secrets if s["severity"] == "MEDIUM"])
+    risk = "Critical" if critical else "High" if high else "Medium" if medium else "Low"
     report += f"""
 ## Summary
 - Total findings: {len(secrets)}
 - Critical: {critical}
 - High: {high}
+- Medium: {medium}
 - Overall risk: **{risk}**
 
 ---
@@ -201,14 +242,19 @@ def generate_report(manifest_data, secrets, signing, apk_name):
     return report
 
 
+# Fix #5: Add argparse for --help
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: python3 analyze.py <apk-path> [--full-report] [--manifest-only]")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(
+        description="APK Analyzer — Static analysis for Android APK packages",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Examples:\n  python3 analyze.py app.apk\n  python3 analyze.py app.apk --full-report\n  python3 analyze.py app.apk --manifest-only"
+    )
+    parser.add_argument("apk_path", help="Path to the APK file to analyze")
+    parser.add_argument("--full-report", action="store_true", help="Generate full security report with secret scanning")
+    parser.add_argument("--manifest-only", action="store_true", help="Only analyze the manifest (fast)")
+    args = parser.parse_args()
 
-    apk_path = sys.argv[1]
-    full_report = "--full-report" in sys.argv
-    manifest_only = "--manifest-only" in sys.argv
+    apk_path = args.apk_path
 
     if not os.path.exists(apk_path):
         print(f"Error: {apk_path} not found")
@@ -217,33 +263,40 @@ def main():
     apk_name = os.path.basename(apk_path)
     decoded_dir = f"/tmp/apk-decoded-{int(datetime.now().timestamp())}"
 
-    if not decode_apk(apk_path, decoded_dir):
-        print("Failed to decode APK. Is apktool installed?")
-        sys.exit(1)
+    # Fix #7: Clean up temp dirs in finally block
+    try:
+        if not decode_apk(apk_path, decoded_dir):
+            print("Failed to decode APK. Is apktool installed?")
+            sys.exit(1)
 
-    log("Analyzing manifest...")
-    manifest_data = analyze_manifest(decoded_dir)
+        log("Analyzing manifest...")
+        manifest_data = analyze_manifest(decoded_dir)
 
-    if manifest_only:
-        print(json.dumps(manifest_data, indent=2))
-        return
+        if args.manifest_only:
+            print(json.dumps(manifest_data, indent=2))
+            return
 
-    secrets = []
-    if full_report or not manifest_only:
-        log("Scanning for secrets...")
-        secrets = scan_secrets(decoded_dir)
+        secrets = []
+        if args.full_report or not args.manifest_only:
+            log("Scanning for secrets...")
+            secrets = scan_secrets(decoded_dir)
 
-    log("Checking signing...")
-    signing = check_signing(apk_path)
+        log("Checking signing...")
+        signing = check_signing(apk_path)
 
-    report = generate_report(manifest_data, secrets, signing, apk_name)
+        report = generate_report(manifest_data, secrets, signing, apk_name)
 
-    report_file = f"analysis-report-{apk_name}.md"
-    with open(report_file, "w") as f:
-        f.write(report)
+        report_file = f"analysis-report-{apk_name}.md"
+        with open(report_file, "w") as f:
+            f.write(report)
 
-    log(f"Report saved: {report_file}")
-    print("\n" + report)
+        log(f"Report saved: {report_file}")
+        print("\n" + report)
+    finally:
+        # Fix #7: Clean up temp decoded directory
+        if os.path.exists(decoded_dir):
+            shutil.rmtree(decoded_dir, ignore_errors=True)
+            log(f"Cleaned up temp dir: {decoded_dir}")
 
 
 if __name__ == "__main__":

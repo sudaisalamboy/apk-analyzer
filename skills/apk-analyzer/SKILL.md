@@ -18,6 +18,20 @@ Use this skill when a user provides an Android APK file for analysis. The skill 
 4. **Checks signing** (v1/v2/v3 signature schemes)
 5. **Generates a report** in Markdown format
 
+## Prerequisites
+
+Before running APK analysis, check that these tools are available:
+
+| Tool | Check | Install |
+|------|-------|--------|
+| apktool | `apktool --version` | `apt install apktool` or [GitHub](https://ibotpeaches.github.io/Apktool/) |
+| jadx | `jadx --version` | [GitHub releases](https://github.com/skylot/jadx/releases) |
+| aapt | `aapt version` | `apt install aapt` |
+| keytool | `keytool -help` | Comes with Java/JDK |
+| Python 3 | `python3 --version` | `apt install python3` |
+
+If any tool is missing, inform the user and provide the install command.
+
 ## Workflow
 
 When a user says "analyze this APK" or provides an APK file:
